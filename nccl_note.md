@@ -12,10 +12,23 @@
 9. 销毁通信器。
 10. 终止MPI环境
 
+## 一些可运用的技术
+### PCIe
+计算机内部连接 GPU、SSD、网卡等设备的高速总线。
+**连接GPU、存储设备、网卡**等计算硬件
 
+### NVLINK
+比 PCIe 快，用于 GPU 间直接通信
+支持 GPU-GPU 直连，避免通过 CPU 传输数据，从而减少延迟
 
+### InfiniBand Verbs
+超低延迟、高带宽的 远程计算机（服务器/节点）之间的通信
+支持 RDMA（远程直接内存访问），减少 CPU 介入
 
-
+### CollNet
+[知乎讲collNet](https://zhuanlan.zhihu.com/p/597081795)
+一种自定义的网络通信方式
++ 将Reduce的计算交给交换机，将node收发的数据量减少了一半
 
 ## 初始化分析
 ### NCCL 任务的调度机制
@@ -28,19 +41,16 @@ NCCL 采用 异步调度，所有的 NCCL 操作（如 ncclAllReduce、ncclBroad
 1. 调用ncclInit()进行nccl库初始化(初步的初始化，基本函数可调用，但还难以通信)
    + 初始化环境，GPU
    + 初始化引导网络，为NCCL网络通信做准备
-   + ![init.cc](nccl-master/src/init.cc)
 2. 调用bootstrapGetUniqueId()函数来获取一个唯一的ID。
    + 包括两部分：一个随机数+一个环境变量（若无则是bootstrap的网络地址） 
-   + ![bootstrap.cc](nccl-master/src/bootstrap.cc)
 
 
-### 初始化通信器ncclCommInitRank
-![init.cc](nccl-master/src/init.cc)
+### 初始化通信器ncclCommInitRank()/ncclCommInitAll()
 1. 加载CUDA驱动
 2. 获取当前CUDA设备ID
 3. 根据CUDA设备ID、UniqueId等完成NCCL通信器初始化
 
-![init.cc](nccl-master/src/init.cc)
+
 ncclCommInitRankDev()
 1. 检测状态
 2. 配置NCCL通信器的一些属性，是否阻塞。通道数量等
@@ -59,11 +69,15 @@ ncclCommInitRankFunc()
 6. 更新通信器状态为成功，表示通信器初始化成功
 
 
+通信器communicator的作用
++ 管理多 GPU 通信
++ 优化数据传输，选择最合适的传输路径
+
 
 ### bootstrapInit()
-![bootstrap.cc](nccl-master/src/bootstrap.cc)
+
 利用已知的rank0网络地址（UniqueId），建立环形网络，allgather获取所有rank的信息
-1. 函数输入ncclUniqueId，从而获得ncclUniqueId中包含的rank0的网络地址，每个rank上都有rank0的网络地址
+1. 函数ncclUniqueId，从而获得ncclUniqueId中包含的rank0的网络地址，每个rank上都有rank0的网络地址
 2. 所有rank根据rank0的网络地址，建立socket并向rank0发送自己的网络地址，rank0上现在就有所有rank的网络地址了
 3. rank0告诉每个rank它的下一个节点网络地址，完成**环形网络**建立（方便进行通信）
 4. AllGather全局收集所有节点的网络地址
@@ -133,7 +147,7 @@ ncclGroupEnd(): 结束 NCCL 组操作，让所有任务一起执行。
 
 ### 初始化分析
 #### bootstrap.cc
-[bootstrap.cc](nccl/src/bootstrap.cc)
+[bootstrap.cc](nccl-2.17.1-1/src/bootstrap.cc)
 进程间通信的初始化机制
 + 进程发现（Process Discovery）
 + 通信参数交换（Exchange Communication Parameters）
@@ -144,12 +158,16 @@ ncclGroupEnd(): 结束 NCCL 组操作，让所有任务一起执行。
 
 
 bootstrapInit():初始化引导的**网络接口**
+
 bootstrapNetSend(sock, data, size) / bootstrapNetRecv(sock, data, size)：通过给定的套接字 (ncclSocket) 发送 / 接收数据。
+
 setFilesLimit()：通过 getrlimit / setrlimit 将进程可打开文件句柄数（RLIMIT_NOFILE）设置为系统最大值。
+
 bootstrapRoot(void* rargs)在 “Root” 线程中运行，负责接收所有 rank（进程）的连接信息并将其分发给各个 rank
 + 依次向每个rank发送“下一个节点”的地址，用于构建ring拓扑环
 
 bootstrapCreateRoot(handle, idFromEnv)：创建 Bootstrap “Root” 的上下文，开启一个新线程跑 bootstrapRoot
+
 bootstrapGetUniqueId(handle)：生成一个全局唯一的 NCCL 引导 ID（即 ncclBootstrapHandle），里面含有随机 magic 和要监听的地址。
 + 包括两部分：一个随机数+一个环境变量（若无则是bootstrap的网络地址）
 
@@ -162,33 +180,37 @@ bootstrapAllGather(commState, allData, size)：把每个 rank 的数据都发到
 + n-1次迭代，反复接受上一片数据并且发给下一片
 
 bootstrapSend(commState, peer, tag, data, size)：发送数据给 peer
+
 bootstrapBarrier(commState, ranks, rank, nranks, tag)：等待所有 rank 完成，在一组（ranks）之内实现 barrier 同步，
+
 bootstrapIntraNodeAllGather：只在给定的进程组（ranks）内做 AllGather，跟 bootstrapAllGather 类似，但只在同节点或更小范围内使用
+
 bootstrapIntraNodeBroadcast：只在给定的进程组（ranks）内做 Broadcast，同上
+
 bootstrapRecv(commState, peer, tag, data, size)：在引导通信中，从指定 peer + tag 接收数据
 + 先看“unexpected”队列，看有没有意外的连接
 + 若无，则阻塞Accept新的连接，判断发来的新消息是否符合(peer, tag)，若符合，则接收数据，否则保存到“unexpected”队列
 
 #### channel.cc
-[channel.cc](nccl/src/channel.cc)
+[channel.cc](nccl-2.17.1-1/src/channel.cc)
 initChannel(struct ncclComm* comm, int channelId)
 + 初始化通道，为每个通道创建一个ncclChannel结构体，并初始化
 + 为通道分配内存，包括 peer 连接信息、环形拓扑（Ring）信息，并且初始化peers结构
 
 #### debug.cc
-[debug.cc](nccl/src/debug.cc)
+[debug.cc](nccl-2.17.1-1/src/debug.cc)
 ncclDebugInit()：初始化 NCCL 日志系统（设置日志级别、日志文件、调试子系统）
 ncclDebugLog(level, flags, filefunc, line, fmt, …)	：通用日志打印函数，供 INFO, WARN, TRACE 级别日志使用
 ncclSetThreadName(thread, fmt, …)：设置 NCCL 线程名称，帮助调试
 
 
 #### net.cc
-[net.cc](nccl/src/net.cc)
+[net.cc](nccl-2.17.1-1/src/net.cc)
 提供不同版本的NCCL网络接口
 
 
 #### enqueue.cc
-[enqueue.cc](nccl/src/enqueue.cc)
+[enqueue.cc](nccl-2.17.1-1/src/enqueue.cc)
 1. 配置了不同的核，最后可以根据不同算法，不同协议，不同归约操作及不同数据类型自动注册通信kernel组合。
 2. ncclInitKernelsForDevice：获取核函数的 最大栈大小 (maxStackSize)。设定 共享内存 carveout 以及 最大动态共享内存大小
 
@@ -229,13 +251,17 @@ ncclSetThreadName(thread, fmt, …)：设置 NCCL 线程名称，帮助调试
 
 
 #### init_nvtx.cc
-[init_nvtx.cc](nccl/src/init_nvtx.cc)
+[init_nvtx.cc](nccl-2.17.1-1/src/init_nvtx.cc)
 在 NVTX（NVIDIA Tools Extension）中注册 NCCL 的 Reduction 操作类型，使得在使用 NCCL 进行 GPU 通信时，可以在 NVTX 事件追踪中更直观地查看 NCCL Reduction 操作的信息
 将原本的数值映射到具体的操作
 
 #### group.cc
-[group.cc](nccl/src/group.cc)
-NCCL 的组操作管理
+
+[group.cc](nccl-2.17.1-1/src/group.cc)
+NCCL 的组操作管理。
++ **一个线程管理多个GPU，反之死锁**
++ **聚合通信，提高性能**
++ **合并**
 核心结构
 + ncclAsyncJob：定义了一个异步任务的通用结构，包括函数指针、destructor、abortFlag、state等等
 + ncclGroupJob()：是 ncclAsyncJob 的特化/子结构，包含更多 group 相关信息
@@ -259,6 +285,8 @@ NCCL 的组操作管理
 6. groupLaunch()：真正执行“分组”中的所有 communicator 及异步任务
    + 进行连接，给每个comm建立p2p连接，等待这些异步线程完成
    +  doLaunches（），将这些kernel plan上传到GPU，并执行
+
+
 
 
 #### init.cc
@@ -403,21 +431,131 @@ NCCL proxy主要用于：跨服务器的GPU通信/非P2P直连通信
 7. ncclProxyCreate()/ncclProxyDestroy():创建/释放Proxy线程
 
 
+### 杂项(misc)分析
+#### argcheck.cc
+[argcheck.cc](nccl-2.17.1-1/src/misc/argcheck.cc)
+1. CudaPtrCheck()：检查 CUDA 指针是否有效，是否匹配当前 NCCL 设备。
+2. PtrCheck()：检查指针是否为空。
+3. ArgsCheck()：对 NCCL 操作的参数进行完整的合法性检查，包括 root 范围、数据类型、操作类型、指针有效性等。
 
 
+#### cudawrap.cc
+[cudawrap.cc](nccl-2.17.1-1/src/misc/cudawrap.cc)
+动态加载 CUDA 运行时库（libcuda.so） 并 初始化一些关键 CUDA API 函数指针，以确保 NCCL 可以正确使用 CUDA 进行计算和数据传输
+1. DECLARE_CUDA_PFN()宏：声明 CUDA 函数指针，并根据版本号进行版本控制。
+2. initOnceFunc()
+   + 读取环境变量
+   + 动态加载CUDA运行时库
+   + 动态加载cuInit和cuDriverGetVersion,用于初始化CUDA和获得CUDA驱动版本
+   + 动态加载cuGetProcAddress 用于动态加载 新版本 CUDA API，提高兼容性
+   + pdfn_cuInit(0)，能够在运行时动态加载适合版本呢的cuInit函数
+3. ncclCudaLibraryInit()确保initOnceFunc()只被调用一次
+
+#### gdrwrap.cc
+[gdrwrap.cc](nccl-2.17.1-1/src/misc/gdrwrap.cc)
+封装 GDRCopy（GPU Direct RDMA）库的 API，提供线程安全的接口，并通过 dlopen() 动态加载 libgdrapi.so 共享库
+1. 有且仅有一次调用initOnceFunc()，动态加载libgdrapi.so并且加载函数指针
+2. wrap_gdr_open() & wrap_gdr_close()：打开/关闭gdr句柄
+3. wrap_gdr_pin_buffer() & wrap_gdr_unpin_buffer()：锁定（Pin）GPU 内存，使其可被 RDMA 直接访问/解除 GPU 内存锁定，释放 RDMA 访问权限。
+4. wrap_gdr_map() & wrap_gdr_unmap()：将 GPU 内存映射到用户空间，以便 CPU 访问/解除 GPU 内存映射，防止内存泄漏
+5. wrap_gdr_copy_to_mapping() & wrap_gdr_copy_from_mapping()：将数据从 CPU 内存复制到 GPU 内存/将数据从 GPU 内存复制到 CPU 内存
+
+#### ibvwrap.cc
+InfiniBand Verbs 是一组用于与 InfiniBand 网络硬件进行交互的低级编程接口。**高速，低延迟**
+[ibvwrap.cc](nccl-2.17.1-1/src/misc/ibvwrap.cc)
+封装 InfiniBand (IB) 动态库 libibverbs.so 的相关 API
+
+#### ipcsocket.cc
+[ipcsocket.cc](nccl-2.17.1-1/src/misc/ipcsocket.cc)
+实现 IPC (进程间通信) 通过 Unix Domain Sockets (UDS) 进行文件描述符 (fd) 传输的功能
+1. ncclIpcSocketInit()：创建Unix Domain Socket，并且使用socket创建UDP的套接字，将socket绑定到特定名称
+2. ncclIpcSocketClose()：关闭Unix Domain Socket，并且删除套接字文件
+3. ncclIpcSocketRecvFd()：接收文件描述符，接收数据并且解析
+4. ncclIpcSocketSendFd()：发送文件描述符，发送数据
+
+#### nvmlwrap.cc
+[nvmlwrap.cc](nccl-2.17.1-1/src/misc/nvmlwrap.cc)
+NVIDIA Management Library (NVML) 的封装，用于 查询 GPU 设备信息、NVLink 连接状态、P2P 访问能力，并且 保证线程安全。主要作用是 检测、管理、优化 GPU 互连，用于 NCCL 计算通信
+
+NVML设备管理
+1. ncclNvmlEnsureInitialized()：
+   + 确保一次初始化
+   + 查询GPU设备数目
+   + 查询GPU之间的P2P状态
+2. ncclNvmlDeviceGetHandleByPciBusId()：通过 PCI Bus ID 获取 GPU 设备句柄（唯一标识每块GPU）
+3. ncclNvmlDeviceGetHandleByIndex()：通过 GPU 设备索引获取 GPU 设备句柄（用于NCCL的进程间GPU资源共享）
+4. ncclNvmlDeviceGetIndex()：通过 GPU 设备句柄获取 GPU 设备索引
 
 
+NVLink互连状态
+1. ncclNvmlDeviceGetNvLinkState()：查询NVLink连接状态，检测NVLink连接是否激活
+2. ncclNvmlDeviceGetNvLinkRemotePciInfo()：获取 NVLink 远端 GPU 的 PCI（总线） 信息
+3. ncclNvmlDeviceGetNvLinkCapability()：查询 NVLink 具体能力，如带宽、双向通信支持等
+
+计算能力& P2P
+1. ncclNvmlDeviceGetCudaComputeCapability()：获取 GPU 的 CUDA 计算能力
+2. ncclNvmlDeviceGetP2PStatus()：查询 GPU 之间的 P2P 访问能力，可以是读/写能力也可以是其他能力（需调用nvmlDeviceGetP2PStatus）
+3. ncclNvmlDeviceGetFieldValues()：获取 GPU 的特定字段值，如 GPU 温度、功耗等
+
+#### profiler.cc
+[profiler.cc](nccl-2.17.1-1/src/misc/profiler.cc)
+NCCL 的性能分析和调试工具，用于记录和分析 NCCL 操作的性能数据
+profiling事件的struct
+```c++
+struct ncclProxyProfileEvent {
+  double timestamp[6];  // 记录不同阶段的时间戳
+  uint64_t opCount;     // 操作计数
+  int peer;             // 发送/接收的对端 ID
+  int step;             // 传输步骤编号
+  uint16_t channel;     // 通信通道 ID
+  uint8_t type;         // 操作类型（Send / Recv）
+  uint8_t opIndex;      // 操作索引（Proxy 操作唯一编号）
+};
+```
+
+1. ncclProfilingRecord()：记录 当前 NCCL 代理（Proxy）操作的时间
+   + 若第一次调用，则初始化profilingEvents，并且记录开始时间
+   + 根据不同state记录不同阶段
+2. ncclProfilingDump()：将 NCCL 代理操作的性能数据 写入到json文件中
+```json
+[
+  {"name": "Send-1-2", "cat": "NET", "ph": "b", "id": 0, "pid": 5, "tid": 1, "ts": 1.23, "args": { "opCount": 100, "proxyOpIndex": 20 } },
+  {"name": "BufferWait", "cat": "NET", "ph": "b", "id": 0, "pid": 5, "tid": 1, "ts": 1.25 },
+  {"name": "BufferWait", "cat": "NET", "ph": "e", "id": 0, "pid": 5, "tid": 1, "ts": 1.30 },
+  {"name": "Send-1-2", "cat": "NET", "ph": "e", "id": 0, "pid": 5, "tid": 1, "ts": 2.00 }
+]
+```
 
 
+#### shmutils.cc
+[shmutils.cc](nccl-2.17.1-1/src/misc/shmutils.cc)
+共享内存管理
+1. ncclShmInit()：初始化共享内存
+2. ncclShmUnlink()：删除共享内存
+3. ncclShmOpen()：打开共享内存
+4. ncclShmClose()：关闭共享内存
 
 
+#### socket.cc
+[socket.cc](nccl-2.17.1-1/src/misc/socket.cc)
+1. findInterfaces()：查找符合用户设定的网络接口，先对用户提供的接口前缀进行解析之后再遍历进行匹配
+2. matchSubnet()：判断本地的接口是否与远程的接口在同一个子网，分别对IPV_4和IPV_6进行匹配
+3. ncclFindInterfaceMatchSubnet()：找到与 remoteAddr 在同一子网 的接口
+4. ncclFindInterfaces()：查找可用的网络接口，并将其存入 ifNames 和 ifAddrs 数组
+   + 自动选择合适的接口：首选ID，其次匹配NCCL_COMM_ID指定的IP地址所在子网 
+5. socketPollConnect()：轮询连接
 
 
-
-
-
-
-
+#### strongstream.cc
+[strongstream.cc](nccl-2.17.1-1/src/misc/strongstream.cc)
+![](note_pic/1.png)
+CUDA 11.3 引入的强同步机制，用于在 CUDA 流中捕获和执行 CUDA 图节点
+1. ncclCudaGetCapturingGraph()：获取当前 CUDA 流的捕获信息，包括捕获状态和图 ID。
+2. ncclCudaGraphAddDestructor()：在 CUDA 图中添加析构函数，用于在图被销毁时执行清理操作。
+   + CUDA 没有机制通知我们用户何时结束捕获，因此我们能做的最好的事情就是在图被销毁时收到通知。
+3. ncclStrongStreamConstruct()：初始化强同步流，创建 CUDA 流和事件，并设置序列化事件。
+4. graphDestructor()：在 CUDA 图被销毁时执行清理操作。
+5. ncclStrongStreamAcquireUncaptured()：确保 ss->cudaStream 可以用于未捕获的（Uncaptured）计算任务
 
 
 
